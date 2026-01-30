@@ -1,0 +1,407 @@
+---
+# ==============================================================================
+# Siwapp Application Deployment - Main Playbook
+# ==============================================================================
+# This playbook deploys the complete Siwapp application stack on AWS
+# 
+# Infrastructure:
+#   - 1x Database Load Balancer (HAProxy)
+#   - 3x Database Servers (MySQL with replication)
+#   - 1x Application Load Balancer (HAProxy)
+#   - 3x Application Servers (Nginx + PHP-FPM + Siwapp)
+#
+# Usage:
+#   ansible-playbook -i inventory/aws.ini site.yml
+# ==============================================================================
+
+- name: Deploy Siwapp - Common Setup
+  hosts: all
+  become: true
+  tags: [common, always]
+  
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      when: ansible_os_family == "Debian"
+
+    - name: Install common packages
+      apt:
+        name:
+          - vim
+          - curl
+          - wget
+          - git
+          - htop
+          - net-tools
+          - software-properties-common
+          - apt-transport-https
+          - ca-certificates
+          - gnupg
+          - lsb-release
+        state: present
+      when: ansible_os_family == "Debian"
+
+    - name: Set timezone to UTC
+      timezone:
+        name: UTC
+
+    - name: Configure hostname
+      hostname:
+        name: "{{ inventory_hostname }}"
+
+# ==============================================================================
+# DATABASE SERVERS
+# ==============================================================================
+
+- name: Deploy MySQL Database Servers
+  hosts: vm_tag_db
+  become: true
+  tags: [database]
+  
+  vars:
+    mysql_root_password: "{{ lookup('env', 'MYSQL_ROOT_PASSWORD') | default('SiwappDB123!', true) }}"
+    mysql_replication_user: "replicator"
+    mysql_replication_password: "{{ lookup('env', 'MYSQL_REPL_PASSWORD') | default('ReplicatorPass123!', true) }}"
+    siwapp_db_name: "siwapp"
+    siwapp_db_user: "siwapp"
+    siwapp_db_password: "{{ lookup('env', 'SIWAPP_DB_PASSWORD') | default('SiwappPass123!', true) }}"
+  
+  tasks:
+    - name: Install MySQL Server
+      apt:
+        name:
+          - mysql-server
+          - mysql-client
+          - python3-mysqldb
+        state: present
+
+    - name: Start MySQL service
+      service:
+        name: mysql
+        state: started
+        enabled: yes
+
+    - name: Set MySQL root password
+      mysql_user:
+        name: root
+        password: "{{ mysql_root_password }}"
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+        state: present
+
+    - name: Create MySQL config for root
+      template:
+        src: templates/mysql-root.cnf.j2
+        dest: /root/.my.cnf
+        mode: '0600'
+
+    - name: Configure MySQL for replication
+      template:
+        src: templates/mysql-replication.cnf.j2
+        dest: /etc/mysql/mysql.conf.d/replication.cnf
+      notify: restart mysql
+
+    - name: Create replication user
+      mysql_user:
+        name: "{{ mysql_replication_user }}"
+        password: "{{ mysql_replication_password }}"
+        priv: "*.*:REPLICATION SLAVE"
+        host: "%"
+        state: present
+      when: "'Lead' in ansible_local.tags | default({}) or ansible_hostname == 'db1'"
+
+    - name: Create Siwapp database
+      mysql_db:
+        name: "{{ siwapp_db_name }}"
+        state: present
+      when: "'Lead' in ansible_local.tags | default({}) or ansible_hostname == 'db1'"
+
+    - name: Create Siwapp database user
+      mysql_user:
+        name: "{{ siwapp_db_user }}"
+        password: "{{ siwapp_db_password }}"
+        priv: "{{ siwapp_db_name }}.*:ALL"
+        host: "%"
+        state: present
+      when: "'Lead' in ansible_local.tags | default({}) or ansible_hostname == 'db1'"
+
+    - name: Get master status
+      mysql_replication:
+        mode: getprimary
+      register: master_status
+      when: "'Lead' in ansible_local.tags | default({}) or ansible_hostname == 'db1'"
+
+    - name: Configure replication on slaves
+      mysql_replication:
+        mode: changeprimary
+        primary_host: "{{ hostvars[groups['vm_tag_db'][0]]['ansible_default_ipv4']['address'] }}"
+        primary_user: "{{ mysql_replication_user }}"
+        primary_password: "{{ mysql_replication_password }}"
+        primary_log_file: "{{ hostvars[groups['vm_tag_db'][0]]['master_status']['File'] }}"
+        primary_log_pos: "{{ hostvars[groups['vm_tag_db'][0]]['master_status']['Position'] }}"
+      when: "'Lead' not in ansible_local.tags | default({}) and ansible_hostname != 'db1'"
+
+    - name: Start replication on slaves
+      mysql_replication:
+        mode: startreplica
+      when: "'Lead' not in ansible_local.tags | default({}) and ansible_hostname != 'db1'"
+
+  handlers:
+    - name: restart mysql
+      service:
+        name: mysql
+        state: restarted
+
+# ==============================================================================
+# DATABASE LOAD BALANCER
+# ==============================================================================
+
+- name: Deploy Database Load Balancer
+  hosts: vm_tag_db_lb
+  become: true
+  tags: [db-loadbalancer]
+  
+  tasks:
+    - name: Install HAProxy
+      apt:
+        name: haproxy
+        state: present
+
+    - name: Configure HAProxy for MySQL
+      template:
+        src: templates/haproxy-db.cfg.j2
+        dest: /etc/haproxy/haproxy.cfg
+      notify: restart haproxy
+
+    - name: Enable HAProxy
+      service:
+        name: haproxy
+        enabled: yes
+        state: started
+
+  handlers:
+    - name: restart haproxy
+      service:
+        name: haproxy
+        state: restarted
+
+# ==============================================================================
+# APPLICATION SERVERS
+# ==============================================================================
+
+- name: Deploy Siwapp Application Servers
+  hosts: vm_tag_app
+  become: true
+  tags: [application]
+  
+  vars:
+    siwapp_version: "master"
+    siwapp_install_dir: "/var/www/siwapp"
+    db_host: "{{ hostvars[groups['vm_tag_db_lb'][0]]['ansible_default_ipv4']['address'] }}"
+    db_name: "siwapp"
+    db_user: "siwapp"
+    db_password: "{{ lookup('env', 'SIWAPP_DB_PASSWORD') | default('SiwappPass123!', true) }}"
+  
+  tasks:
+    - name: Add PHP repository
+      apt_repository:
+        repo: ppa:ondrej/php
+        state: present
+
+    - name: Install PHP and extensions
+      apt:
+        name:
+          - php8.1-fpm
+          - php8.1-cli
+          - php8.1-mysql
+          - php8.1-gd
+          - php8.1-xml
+          - php8.1-mbstring
+          - php8.1-curl
+          - php8.1-zip
+          - php8.1-intl
+          - unzip
+        state: present
+
+    - name: Install Nginx
+      apt:
+        name: nginx
+        state: present
+
+    - name: Install Composer
+      shell: |
+        curl -sS https://getcomposer.org/installer | php
+        mv composer.phar /usr/local/bin/composer
+        chmod +x /usr/local/bin/composer
+      args:
+        creates: /usr/local/bin/composer
+
+    - name: Create Siwapp directory
+      file:
+        path: "{{ siwapp_install_dir }}"
+        state: directory
+        owner: www-data
+        group: www-data
+        mode: '0755'
+
+    - name: Clone Siwapp repository
+      git:
+        repo: https://github.com/siwapp/siwapp.git
+        dest: "{{ siwapp_install_dir }}"
+        version: "{{ siwapp_version }}"
+        force: yes
+      become_user: www-data
+
+    - name: Install Siwapp dependencies
+      composer:
+        command: install
+        working_dir: "{{ siwapp_install_dir }}"
+        no_dev: yes
+        optimize_autoloader: yes
+      become_user: www-data
+
+    - name: Configure Siwapp database
+      template:
+        src: templates/siwapp-parameters.yml.j2
+        dest: "{{ siwapp_install_dir }}/app/config/parameters.yml"
+        owner: www-data
+        group: www-data
+        mode: '0644'
+
+    - name: Create cache and logs directories
+      file:
+        path: "{{ siwapp_install_dir }}/{{ item }}"
+        state: directory
+        owner: www-data
+        group: www-data
+        mode: '0775'
+      loop:
+        - app/cache
+        - app/logs
+
+    - name: Run database migrations
+      command: php {{ siwapp_install_dir }}/app/console doctrine:schema:update --force
+      become_user: www-data
+      run_once: yes
+      delegate_to: "{{ groups['vm_tag_app'][0] }}"
+
+    - name: Configure PHP-FPM
+      template:
+        src: templates/php-fpm-pool.conf.j2
+        dest: /etc/php/8.1/fpm/pool.d/siwapp.conf
+      notify: restart php-fpm
+
+    - name: Configure Nginx
+      template:
+        src: templates/nginx-siwapp.conf.j2
+        dest: /etc/nginx/sites-available/siwapp
+      notify: restart nginx
+
+    - name: Enable Siwapp site
+      file:
+        src: /etc/nginx/sites-available/siwapp
+        dest: /etc/nginx/sites-enabled/siwapp
+        state: link
+      notify: restart nginx
+
+    - name: Disable default Nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: restart nginx
+
+    - name: Start PHP-FPM
+      service:
+        name: php8.1-fpm
+        state: started
+        enabled: yes
+
+    - name: Start Nginx
+      service:
+        name: nginx
+        state: started
+        enabled: yes
+
+  handlers:
+    - name: restart php-fpm
+      service:
+        name: php8.1-fpm
+        state: restarted
+
+    - name: restart nginx
+      service:
+        name: nginx
+        state: restarted
+
+# ==============================================================================
+# APPLICATION LOAD BALANCER
+# ==============================================================================
+
+- name: Deploy Application Load Balancer
+  hosts: vm_tag_app_lb
+  become: true
+  tags: [app-loadbalancer]
+  
+  tasks:
+    - name: Install HAProxy
+      apt:
+        name: haproxy
+        state: present
+
+    - name: Configure HAProxy for application
+      template:
+        src: templates/haproxy-app.cfg.j2
+        dest: /etc/haproxy/haproxy.cfg
+      notify: restart haproxy
+
+    - name: Enable HAProxy
+      service:
+        name: haproxy
+        enabled: yes
+        state: started
+
+  handlers:
+    - name: restart haproxy
+      service:
+        name: haproxy
+        state: restarted
+
+# ==============================================================================
+# FINAL VERIFICATION
+# ==============================================================================
+
+- name: Verify Deployment
+  hosts: vm_tag_app_lb
+  become: true
+  tags: [verify]
+  
+  tasks:
+    - name: Wait for application to be ready
+      wait_for:
+        port: 80
+        delay: 5
+        timeout: 60
+
+    - name: Check application health
+      uri:
+        url: "http://{{ ansible_default_ipv4.address }}/"
+        status_code: 200
+      register: health_check
+      retries: 3
+      delay: 5
+      until: health_check.status == 200
+
+    - name: Display success message
+      debug:
+        msg: |
+          ✅ Siwapp deployment successful!
+          
+          Access your application at:
+          http://{{ ansible_default_ipv4.address }}/
+          
+          Default credentials:
+          Username: admin
+          Password: admin
+          
+          ⚠️  IMPORTANT: Change default password immediately!
