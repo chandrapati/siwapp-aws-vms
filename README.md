@@ -1,5 +1,7 @@
 # SIWAPP AWS Deployment Guide
 
+![Visitors](https://visitor-badge.laobi.icu/badge?page_id=chandrapati.siwapp-aws-vms&left_text=visitors)
+
 ## Overview
 This deployment will create 8 EC2 instances on AWS in the us-east-1 region:
 - 1 Database Load Balancer
