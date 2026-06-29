@@ -50,7 +50,7 @@ variable "pvt_key" {
 }
 
 variable "s3_bucket_name" {
-  description = "S3 bucket name for VPC flow logs"
+  description = "S3 bucket name for VPC flow logs (must exist; apply a 7-day lifecycle rule on flow log objects for CSW POV)"
   type        = string
   default     = "secureworkloadvpcflowbuckets"
 }
